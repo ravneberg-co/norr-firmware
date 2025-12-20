@@ -1,7 +1,7 @@
 /**
- * Norr LoRa Bridge Firmware for RAK4631
+ * Norr LoRa Bridge Firmware for LilyGO T-Beam
  *
- * Serial <-> LoRa bridge with OLED display (RAK1921)
+ * Serial <-> LoRa bridge using RadioLib (supports SX1276/SX1262)
  *
  * Protocol:
  *   Serial RX -> LoRa TX (broadcast)
@@ -9,36 +9,46 @@
  *
  * Frame format (both directions):
  *   [0xAA][LENGTH_HI][LENGTH_LO][PAYLOAD...][CRC_HI][CRC_LO][0x55]
+ *
+ * T-Beam v1.1/v1.2 pinout:
+ *   LoRa: NSS=18, DIO0=26, RST=23, DIO1=33
+ *   OLED: SDA=21, SCL=22 (if installed)
+ *   GPS: TX=34, RX=12
  */
 
 #include <Arduino.h>
-#include <SX126x-Arduino.h>
 #include <SPI.h>
+#include <RadioLib.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
 // Firmware version
-#define FW_VERSION "2.3"
+#define FW_VERSION "1.0"
 
-// OLED Configuration (RAK1921 - SSD1306 128x64)
+// T-Beam v1.1/v1.2 LoRa pins
+#define LORA_SCK   5
+#define LORA_MISO  19
+#define LORA_MOSI  27
+#define LORA_NSS   18
+#define LORA_DIO0  26
+#define LORA_RST   14   // T-Beam v1.1
+#define LORA_DIO1  33
+
+// OLED Configuration (if connected)
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 #define OLED_RESET -1
 #define SCREEN_ADDRESS 0x3C
 
-// LoRa Configuration
-#define RF_FREQUENCY 865000000  // Hz (NZ_865 - New Zealand 865 MHz ISM band)
-#define TX_OUTPUT_POWER 22      // dBm (max for SX1262)
-#define LORA_BANDWIDTH 0        // 0 = 125 kHz
-#define LORA_SPREADING_FACTOR 9 // SF7-SF12
-#define LORA_CODINGRATE 1       // 1 = 4/5
-#define LORA_PREAMBLE_LENGTH 8
-#define LORA_SYMBOL_TIMEOUT 0
-#define LORA_FIX_LENGTH_PAYLOAD_ON false
-#define LORA_IQ_INVERSION_ON false
-#define TX_TIMEOUT_VALUE 3000
-#define RX_TIMEOUT_VALUE 0      // Continuous receive
+// LoRa Configuration (match RAK4631 settings)
+#define RF_FREQUENCY      865.0   // MHz
+#define TX_POWER          14      // dBm (SX1276 max is 17)
+#define BANDWIDTH         125.0   // kHz
+#define SPREADING_FACTOR  9
+#define CODING_RATE       5       // 4/5
+#define PREAMBLE_LENGTH   8
+#define SYNC_WORD         0x12
 
 // Protocol constants
 #define START_MARKER    0xAA
@@ -49,153 +59,157 @@
 // Display update interval
 #define DISPLAY_UPDATE_MS 250
 
-// Buffers
-static uint8_t loraBuffer[MAX_PAYLOAD];
-static RadioEvents_t RadioEvents;
-static volatile bool txDone = true;
+// Radio instance (created in setup after SPI.begin)
+SX1276 *radio = nullptr;
 
 // OLED display
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 static bool oledAvailable = false;
 
+// Buffers
+static uint8_t loraBuffer[MAX_PAYLOAD];
+static uint8_t rxBuffer[MAX_PAYLOAD];
+static volatile bool txDone = true;
+static volatile bool rxFlag = false;
+static volatile int rxLength = 0;
+
 // Statistics
 static uint32_t txCount = 0;
 static uint32_t rxCount = 0;
 static uint32_t queueCount = 0;
-static int16_t lastRssi = 0;
-static int8_t lastSnr = 0;
+static float lastRssi = 0;
+static float lastSnr = 0;
 
-// Activity indicators (flash for 200ms)
+// Activity indicators
 static unsigned long txFlashUntil = 0;
 static unsigned long rxFlashUntil = 0;
 static unsigned long lastDisplayUpdate = 0;
 
-// Norr logo bitmap (15x32 pixels) - actual Norr logo
+// Norr logo bitmap (15x32 pixels)
 #define LOGO_WIDTH 15
 #define LOGO_HEIGHT 32
 static const unsigned char PROGMEM norr_logo_vertical[] = {
-  0x00, 0x00,  // row 0
-  0x00, 0x00,  // row 1
-  0x01, 0x00,  // row 2
-  0x01, 0x00,  // row 3
-  0x03, 0x80,  // row 4
-  0x03, 0x80,  // row 5
-  0x01, 0x00,  // row 6
-  0x01, 0x00,  // row 7
-  0x01, 0x00,  // row 8
-  0xF1, 0x3E,  // row 9
-  0x79, 0x1C,  // row 10
-  0x7D, 0x1C,  // row 11
-  0x7F, 0x1C,  // row 12
-  0x7F, 0x1C,  // row 13
-  0x7F, 0x1C,  // row 14
-  0x77, 0x9C,  // row 15
-  0x73, 0xDC,  // row 16
-  0x71, 0xFC,  // row 17
-  0x71, 0xFC,  // row 18
-  0x71, 0xFC,  // row 19
-  0x71, 0x7C,  // row 20
-  0x71, 0x3C,  // row 21
-  0x71, 0x1C,  // row 22
-  0xF9, 0x1E,  // row 23
-  0x01, 0x00,  // row 24
-  0x01, 0x00,  // row 25
-  0x03, 0x80,  // row 26
-  0x03, 0x80,  // row 27
-  0x03, 0x80,  // row 28
-  0x02, 0x80,  // row 29
-  0x00, 0x00,  // row 30
-  0x00, 0x00   // row 31
+  0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00,
+  0x03, 0x80, 0x03, 0x80, 0x01, 0x00, 0x01, 0x00,
+  0x01, 0x00, 0xF1, 0x3E, 0x79, 0x1C, 0x7D, 0x1C,
+  0x7F, 0x1C, 0x7F, 0x1C, 0x7F, 0x1C, 0x77, 0x9C,
+  0x73, 0xDC, 0x71, 0xFC, 0x71, 0xFC, 0x71, 0xFC,
+  0x71, 0x7C, 0x71, 0x3C, 0x71, 0x1C, 0xF9, 0x1E,
+  0x01, 0x00, 0x01, 0x00, 0x03, 0x80, 0x03, 0x80,
+  0x03, 0x80, 0x02, 0x80, 0x00, 0x00, 0x00, 0x00
 };
 
+// ISR flags
+#if defined(ESP8266) || defined(ESP32)
+  ICACHE_RAM_ATTR
+#endif
+void setRxFlag(void) {
+  rxFlag = true;
+}
+
 // Forward declarations
-void OnTxDone(void);
-void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr);
-void OnTxTimeout(void);
-void OnRxTimeout(void);
-void OnRxError(void);
+void initOLED();
+void updateDisplay();
 void handleSerialInput();
 uint16_t calculateCRC(uint8_t* data, size_t len);
 void sendToSerial(uint8_t* data, size_t len);
-void initOLED();
-void updateDisplay();
-void drawStartupScreen();
 
 void setup() {
-  // Initialize serial
   Serial.begin(115200);
+  delay(1000);  // Wait for serial
 
-  time_t timeout = millis();
-  while (!Serial) {
-    if ((millis() - timeout) < 3000) {
-      delay(100);
-    } else {
-      break;
-    }
-  }
+  Serial.println("\n[Norr LoRa Bridge T-Beam v" FW_VERSION "]");
+  Serial.println("Using RadioLib");
 
-  Serial.println("\n[Norr LoRa Bridge v" FW_VERSION "]");
+  // Initialize SPI for LoRa (T-Beam uses non-default pins)
+  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_NSS);
+
+  // Create radio instance AFTER SPI.begin()
+  radio = new SX1276(new Module(LORA_NSS, LORA_DIO0, LORA_RST, LORA_DIO1, SPI));
 
   // Initialize OLED
   initOLED();
 
   // Initialize LoRa
   Serial.print("LoRa init: ");
-  lora_rak4630_init();
-  Serial.println("OK");
+  int state = radio->begin(RF_FREQUENCY, BANDWIDTH, SPREADING_FACTOR,
+                          CODING_RATE, SYNC_WORD, TX_POWER, PREAMBLE_LENGTH);
 
-  // Initialize Radio callbacks
-  RadioEvents.TxDone = OnTxDone;
-  RadioEvents.RxDone = OnRxDone;
-  RadioEvents.TxTimeout = OnTxTimeout;
-  RadioEvents.RxTimeout = OnRxTimeout;
-  RadioEvents.RxError = OnRxError;
-  RadioEvents.CadDone = NULL;
+  if (state == RADIOLIB_ERR_NONE) {
+    Serial.println("OK");
+  } else {
+    Serial.print("FAILED: ");
+    Serial.println(state);
+    // Show error on OLED
+    if (oledAvailable) {
+      display.clearDisplay();
+      display.setCursor(0, 0);
+      display.print("LoRa FAILED!");
+      display.setCursor(0, 16);
+      display.print("Error: ");
+      display.print(state);
+      display.setCursor(0, 32);
+      display.print("Check wiring");
+      display.display();
+    }
+    while (true) { delay(1000); }
+  }
 
-  // Initialize the Radio
-  Serial.print("Radio init: ");
-  Radio.Init(&RadioEvents);
-  Serial.println("OK");
+  // Set DIO0 action for RX done
+  radio->setDio0Action(setRxFlag, RISING);
 
-  // Set Radio channel
-  Radio.SetChannel(RF_FREQUENCY);
-
-  // Set Radio TX configuration
-  Radio.SetTxConfig(MODEM_LORA, TX_OUTPUT_POWER, 0, LORA_BANDWIDTH,
-                    LORA_SPREADING_FACTOR, LORA_CODINGRATE,
-                    LORA_PREAMBLE_LENGTH, LORA_FIX_LENGTH_PAYLOAD_ON,
-                    true, 0, 0, LORA_IQ_INVERSION_ON, TX_TIMEOUT_VALUE);
-
-  // Set Radio RX configuration
-  Radio.SetRxConfig(MODEM_LORA, LORA_BANDWIDTH, LORA_SPREADING_FACTOR,
-                    LORA_CODINGRATE, 0, LORA_PREAMBLE_LENGTH,
-                    LORA_SYMBOL_TIMEOUT, LORA_FIX_LENGTH_PAYLOAD_ON,
-                    0, true, 0, 0, LORA_IQ_INVERSION_ON, true);
-
-  // Start continuous receive
+  // Start receiving
   Serial.print("Start RX: ");
-  Radio.Rx(RX_TIMEOUT_VALUE);
-  Serial.println("OK");
+  state = radio->startReceive();
+  if (state == RADIOLIB_ERR_NONE) {
+    Serial.println("OK");
+  } else {
+    Serial.print("FAILED: ");
+    Serial.println(state);
+  }
 
   Serial.println("================");
   Serial.println("Ready. Listening...");
   Serial.print("Freq: ");
-  Serial.print(RF_FREQUENCY / 1000000.0);
+  Serial.print(RF_FREQUENCY);
   Serial.print(" MHz, SF");
-  Serial.print(LORA_SPREADING_FACTOR);
+  Serial.print(SPREADING_FACTOR);
   Serial.println(", BW 125 kHz");
   Serial.println("================");
-
-  // Show startup complete on OLED
-  if (oledAvailable) {
-    delay(1000);  // Show startup screen a bit longer
-    updateDisplay();
-  }
 }
 
 void loop() {
-  // Handle any pending Radio events
-  Radio.IrqProcess();
+  // Check for received packet
+  if (rxFlag) {
+    rxFlag = false;
+
+    int len = radio->getPacketLength();
+    if (len > 0 && len <= MAX_PAYLOAD) {
+      int state = radio->readData(rxBuffer, len);
+
+      if (state == RADIOLIB_ERR_NONE) {
+        // Get signal info
+        lastRssi = radio->getRSSI();
+        lastSnr = radio->getSNR();
+
+        // Send to serial
+        sendToSerial(rxBuffer, len);
+
+        rxCount++;
+        rxFlashUntil = millis() + 200;
+
+        Serial.print("[RX] ");
+        Serial.print(len);
+        Serial.print(" bytes, RSSI: ");
+        Serial.print(lastRssi);
+        Serial.print(", SNR: ");
+        Serial.println(lastSnr);
+      }
+    }
+
+    // Restart receive
+    radio->startReceive();
+  }
 
   // Handle incoming serial data
   handleSerialInput();
@@ -209,51 +223,32 @@ void loop() {
 
 // Initialize OLED display
 void initOLED() {
-  Wire.begin();
+  Wire.begin(21, 22);  // T-Beam I2C pins
 
   if (display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
     oledAvailable = true;
     Serial.println("OLED: OK");
-    drawStartupScreen();
+
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(20, 20);
+    display.print("NORR T-Beam v");
+    display.print(FW_VERSION);
+    display.setCursor(20, 40);
+    display.print("Initializing...");
+    display.display();
   } else {
     oledAvailable = false;
     Serial.println("OLED: Not found");
   }
 }
 
-// Draw startup screen with logo
-void drawStartupScreen() {
-  display.clearDisplay();
-
-  // Draw vertical Norr logo on left side (centered vertically)
-  display.drawBitmap(0, 16, norr_logo_vertical, LOGO_WIDTH, LOGO_HEIGHT, SSD1306_WHITE);
-
-  // Vertical line separator
-  display.drawLine(18, 0, 18, 63, SSD1306_WHITE);
-
-  // "NORR" text
-  display.setTextSize(2);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(28, 8);
-  display.print("NORR");
-
-  // Version and status
-  display.setTextSize(1);
-  display.setCursor(24, 32);
-  display.print("LoRa Bridge v");
-  display.print(FW_VERSION);
-
-  display.setCursor(32, 48);
-  display.print("Initializing...");
-
-  display.display();
-}
-
 // Update display with current status
 void updateDisplay() {
   display.clearDisplay();
 
-  // === Left sidebar: Norr logo (centered) ===
+  // Left sidebar: Norr logo
   display.drawBitmap(0, 8, norr_logo_vertical, LOGO_WIDTH, LOGO_HEIGHT, SSD1306_WHITE);
 
   // "NORR" and version below logo
@@ -268,18 +263,18 @@ void updateDisplay() {
   // Vertical separator line
   display.drawLine(26, 0, 26, 63, SSD1306_WHITE);
 
-  // Content area starts at x=30, right edge with 2px margin
+  // Content area
   const int X = 30;
-  const int R = 125;  // Right edge with margin
+  const int R = 125;
 
-  // === Row 1: Frequency and SF ===
+  // Row 1: Frequency and SF
   display.setCursor(X, 0);
   display.print("865MHz");
-  display.setCursor(R - 17, 0);  // "SF9" aligned right
+  display.setCursor(R - 17, 0);
   display.print("SF");
-  display.print(LORA_SPREADING_FACTOR);
+  display.print(SPREADING_FACTOR);
 
-  // === Row 2: TX/RX ===
+  // Row 2: TX/RX
   unsigned long now = millis();
 
   display.setCursor(X, 12);
@@ -292,7 +287,7 @@ void updateDisplay() {
   display.print(txCount);
   display.setTextColor(SSD1306_WHITE);
 
-  display.setCursor(R - 36, 12);  // "↓RX:0" = 6 chars * 6px = 36
+  display.setCursor(R - 36, 12);
   if (now < rxFlashUntil) {
     display.fillRect(R - 38, 11, 40, 9, SSD1306_WHITE);
     display.setTextColor(SSD1306_BLACK);
@@ -302,18 +297,18 @@ void updateDisplay() {
   display.print(rxCount);
   display.setTextColor(SSD1306_WHITE);
 
-  // === Row 3: RSSI/SNR ===
+  // Row 3: RSSI/SNR
   display.setCursor(X, 24);
   display.print("RSSI:");
-  display.print(lastRssi);
-  display.setCursor(R - 36, 24);  // "SNR:0" = 6 chars * 6px = 36
+  display.print((int)lastRssi);
+  display.setCursor(R - 36, 24);
   display.print("SNR:");
-  display.print(lastSnr);
+  display.print((int)lastSnr);
 
-  // === Divider ===
+  // Divider
   display.drawLine(X - 2, 34, 127, 34, SSD1306_WHITE);
 
-  // === Row 4: Status and peers ===
+  // Row 4: Status and peers
   display.setCursor(X, 40);
   if (!txDone) {
     display.print("SENDING");
@@ -321,11 +316,11 @@ void updateDisplay() {
     display.print("LISTEN");
   }
 
-  display.setCursor(R - 48, 40);  // "Peers:0" = 8 chars * 6px = 48
+  display.setCursor(R - 48, 40);
   display.print("Peers:");
   display.print(rxCount > 0 ? 1 : 0);
 
-  // === Row 5: Uptime and queue ===
+  // Row 5: Uptime and queue
   display.setCursor(X, 52);
   unsigned long uptime = millis() / 1000;
   unsigned long hours = uptime / 3600;
@@ -341,62 +336,11 @@ void updateDisplay() {
   display.print(secs);
   display.print("s");
 
-  display.setCursor(R - 24, 52);  // "Q:0" = 4 chars * 6px = 24
+  display.setCursor(R - 24, 52);
   display.print("Q:");
   display.print(queueCount);
 
   display.display();
-}
-
-// LoRa TX Done callback
-void OnTxDone(void) {
-  Serial.println("[TX] Done");
-  txDone = true;
-  txCount++;
-  txFlashUntil = millis() + 200;
-
-  delay(20);
-  Radio.Rx(RX_TIMEOUT_VALUE);
-}
-
-// LoRa RX Done callback
-void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr) {
-  if (size > 0 && size <= MAX_PAYLOAD) {
-    sendToSerial(payload, size);
-
-    rxCount++;
-    lastRssi = rssi;
-    lastSnr = snr;
-    rxFlashUntil = millis() + 200;
-
-    Serial.print("[RX] ");
-    Serial.print(size);
-    Serial.print(" bytes, RSSI: ");
-    Serial.print(rssi);
-    Serial.print(", SNR: ");
-    Serial.println(snr);
-  }
-
-  Radio.Rx(RX_TIMEOUT_VALUE);
-}
-
-// LoRa TX Timeout callback
-void OnTxTimeout(void) {
-  Serial.println("[TX] Timeout");
-  txDone = true;
-  delay(20);
-  Radio.Rx(RX_TIMEOUT_VALUE);
-}
-
-// LoRa RX Timeout callback
-void OnRxTimeout(void) {
-  Radio.Rx(RX_TIMEOUT_VALUE);
-}
-
-// LoRa RX Error callback
-void OnRxError(void) {
-  Serial.println("[RX] Error");
-  Radio.Rx(RX_TIMEOUT_VALUE);
 }
 
 // Calculate CRC16 (CCITT)
@@ -446,7 +390,7 @@ void handleSerialInput() {
         if (b == START_MARKER) {
           state = READ_LEN_HI;
           bytesRead = 0;
-          queueCount++;  // Track pending TX
+          queueCount++;
         }
         break;
 
@@ -488,20 +432,30 @@ void handleSerialInput() {
         if (b == END_MARKER) {
           uint16_t calculatedCrc = calculateCRC(loraBuffer, payloadLen);
 
-          noInterrupts();
-          bool canSend = txDone;
-          if (canSend) {
+          if (calculatedCrc == receivedCrc && txDone) {
             txDone = false;
-          }
-          interrupts();
+            txFlashUntil = millis() + 200;
 
-          if (calculatedCrc == receivedCrc && canSend) {
-            Radio.Send(loraBuffer, payloadLen);
             Serial.print("[TX] Sending ");
             Serial.print(payloadLen);
             Serial.println(" bytes...");
+
+            int state = radio->transmit(loraBuffer, payloadLen);
+
+            if (state == RADIOLIB_ERR_NONE) {
+              Serial.println("[TX] Done");
+              txCount++;
+            } else {
+              Serial.print("[TX] Failed: ");
+              Serial.println(state);
+            }
+
+            txDone = true;
             queueCount--;
-          } else if (!canSend) {
+
+            // Restart receive
+            radio->startReceive();
+          } else if (!txDone) {
             Serial.println("[TX] Busy");
           } else {
             Serial.println("[CRC ERR]");
