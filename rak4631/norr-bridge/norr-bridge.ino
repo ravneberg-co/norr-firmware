@@ -19,7 +19,7 @@
 #include <Adafruit_SSD1306.h>
 
 // Firmware version
-#define FW_VERSION "2.3"
+#define FW_VERSION "2.4"
 
 // OLED Configuration (RAK1921 - SSD1306 128x64)
 #define SCREEN_WIDTH 128
@@ -69,6 +69,69 @@ static int8_t lastSnr = 0;
 static unsigned long txFlashUntil = 0;
 static unsigned long rxFlashUntil = 0;
 static unsigned long lastDisplayUpdate = 0;
+
+// Peer tracking - based on first 16 bytes (DestinationID in Norr wire format)
+#define MAX_PEERS 8
+#define PEER_SIGNATURE_LEN 16
+#define PEER_TIMEOUT_MS 300000  // 5 minutes
+struct PeerInfo {
+  uint8_t signature[PEER_SIGNATURE_LEN];
+  unsigned long lastSeen;
+  bool active;
+};
+static PeerInfo peers[MAX_PEERS];
+static uint8_t peerCount = 0;
+
+// Check if peer exists, add if new, update lastSeen
+void updatePeer(uint8_t* payload, uint16_t size) {
+  if (size < PEER_SIGNATURE_LEN) return;
+
+  unsigned long now = millis();
+
+  // First, expire old peers
+  peerCount = 0;
+  for (int i = 0; i < MAX_PEERS; i++) {
+    if (peers[i].active) {
+      if (now - peers[i].lastSeen > PEER_TIMEOUT_MS) {
+        peers[i].active = false;
+      } else {
+        peerCount++;
+      }
+    }
+  }
+
+  // Check if this peer already exists
+  for (int i = 0; i < MAX_PEERS; i++) {
+    if (peers[i].active && memcmp(peers[i].signature, payload, PEER_SIGNATURE_LEN) == 0) {
+      peers[i].lastSeen = now;
+      return;  // Already known
+    }
+  }
+
+  // New peer - find empty slot
+  for (int i = 0; i < MAX_PEERS; i++) {
+    if (!peers[i].active) {
+      memcpy(peers[i].signature, payload, PEER_SIGNATURE_LEN);
+      peers[i].lastSeen = now;
+      peers[i].active = true;
+      peerCount++;
+      return;
+    }
+  }
+
+  // No empty slot - replace oldest
+  int oldest = 0;
+  unsigned long oldestTime = peers[0].lastSeen;
+  for (int i = 1; i < MAX_PEERS; i++) {
+    if (peers[i].lastSeen < oldestTime) {
+      oldest = i;
+      oldestTime = peers[i].lastSeen;
+    }
+  }
+  memcpy(peers[oldest].signature, payload, PEER_SIGNATURE_LEN);
+  peers[oldest].lastSeen = now;
+  peers[oldest].active = true;
+}
 
 // Norr logo bitmap (15x32 pixels) - actual Norr logo
 #define LOGO_WIDTH 15
@@ -321,9 +384,9 @@ void updateDisplay() {
     display.print("LISTEN");
   }
 
-  display.setCursor(R - 48, 40);  // "Peers:0" = 8 chars * 6px = 48
+  display.setCursor(R - 48, 40);  // "Peers:X" = 8 chars * 6px = 48
   display.print("Peers:");
-  display.print(rxCount > 0 ? 1 : 0);
+  display.print(peerCount);
 
   // === Row 5: Uptime and queue ===
   display.setCursor(X, 52);
@@ -368,6 +431,9 @@ void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr) {
     lastRssi = rssi;
     lastSnr = snr;
     rxFlashUntil = millis() + 200;
+
+    // Track unique peers
+    updatePeer(payload, size);
 
     Serial.print("[RX] ");
     Serial.print(size);
