@@ -19,7 +19,7 @@
 #include <Adafruit_SSD1306.h>
 
 // Firmware version
-#define FW_VERSION "2.4"
+#define FW_VERSION "2.5"  // Added reactive flow control (READY signal)
 
 // OLED Configuration (RAK1921 - SSD1306 128x64)
 #define SCREEN_WIDTH 128
@@ -413,13 +413,15 @@ void updateDisplay() {
 
 // LoRa TX Done callback
 void OnTxDone(void) {
-  Serial.println("[TX] Done");
   txDone = true;
   txCount++;
   txFlashUntil = millis() + 200;
 
   delay(20);
   Radio.Rx(RX_TIMEOUT_VALUE);
+
+  // Signal host that we're ready for next packet (reactive flow control)
+  Serial.println("READY");
 }
 
 // LoRa RX Done callback
