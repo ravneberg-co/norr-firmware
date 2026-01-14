@@ -22,7 +22,7 @@
 #include <Adafruit_SSD1306.h>
 
 // Firmware version
-#define FW_VERSION "1.1"
+#define FW_VERSION "1.2"
 
 // Set to 1 for verbose debug output
 #define DEBUG_VERBOSE 0
@@ -141,6 +141,26 @@ void rxISR(void) {
 uint32_t crc32(const uint8_t* data, size_t len) {
     uint32_t crc = 0xFFFFFFFF;
     for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int j = 0; j < 8; j++) {
+            crc = (crc >> 1) ^ (0xEDB88320 & -(crc & 1));
+        }
+    }
+    return ~crc;
+}
+
+// Hash packet for dedup, skipping byte 1 (hop count)
+// This ensures same packet at different hop counts has same hash
+uint32_t packetHash(const uint8_t* data, size_t len) {
+    if (len < 2) return crc32(data, len);
+    uint32_t crc = 0xFFFFFFFF;
+    // Hash byte 0
+    crc ^= data[0];
+    for (int j = 0; j < 8; j++) {
+        crc = (crc >> 1) ^ (0xEDB88320 & -(crc & 1));
+    }
+    // Skip byte 1 (hop count), hash bytes 2+
+    for (size_t i = 2; i < len; i++) {
         crc ^= data[i];
         for (int j = 0; j < 8; j++) {
             crc = (crc >> 1) ^ (0xEDB88320 & -(crc & 1));
@@ -473,8 +493,8 @@ void loop() {
         return;
     }
 
-    // Calculate hash for dedup
-    uint32_t hash = crc32(rxBuffer, rxLen);
+    // Calculate hash for dedup (skip hop count byte)
+    uint32_t hash = packetHash(rxBuffer, rxLen);
 
     // Seen recently?
     if (seenRecently(hash)) {
