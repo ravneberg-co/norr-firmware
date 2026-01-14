@@ -18,9 +18,11 @@
 #include <SPI.h>
 #include <Wire.h>
 #include <RadioLib.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 
 // Firmware version
-#define FW_VERSION "1.0"
+#define FW_VERSION "1.1"
 
 // Set to 1 for verbose debug output
 #define DEBUG_VERBOSE 0
@@ -49,8 +51,60 @@
 #define DELAY_MAX_MS      150     // Maximum retransmit delay
 #define MAX_PACKET_SIZE   255
 
-// LED pin (T-Beam 1.1 has LED on GPIO 14)
-#define LED_PIN           LED_BUILTIN
+// LED disabled - only AXP charging LED active
+// #define LED_PIN           LED_BUILTIN
+
+// Button for display toggle (T-Beam has button on GPIO 38)
+#define BUTTON_PIN        38
+
+// OLED display (128x64 SSD1306 on I2C)
+#define SCREEN_WIDTH      128
+#define SCREEN_HEIGHT     64
+#define OLED_ADDR         0x3C
+#define LOGO_WIDTH        16
+#define LOGO_HEIGHT       32
+
+// Norr logo bitmap (16x32)
+static const unsigned char PROGMEM norr_logo[] = {
+  0x00, 0x00,  // row 0
+  0x00, 0x00,  // row 1
+  0x01, 0x00,  // row 2
+  0x01, 0x00,  // row 3
+  0x03, 0x80,  // row 4
+  0x03, 0x80,  // row 5
+  0x01, 0x00,  // row 6
+  0x01, 0x00,  // row 7
+  0x01, 0x00,  // row 8
+  0xF1, 0x3E,  // row 9
+  0x79, 0x1C,  // row 10
+  0x7D, 0x1C,  // row 11
+  0x7F, 0x1C,  // row 12
+  0x7F, 0x1C,  // row 13
+  0x7F, 0x1C,  // row 14
+  0x77, 0x9C,  // row 15
+  0x73, 0xDC,  // row 16
+  0x71, 0xFC,  // row 17
+  0x71, 0xFC,  // row 18
+  0x71, 0xFC,  // row 19
+  0x71, 0x7C,  // row 20
+  0x71, 0x3C,  // row 21
+  0x71, 0x1C,  // row 22
+  0xF9, 0x1E,  // row 23
+  0x01, 0x00,  // row 24
+  0x01, 0x00,  // row 25
+  0x03, 0x80,  // row 26
+  0x03, 0x80,  // row 27
+  0x03, 0x80,  // row 28
+  0x02, 0x80,  // row 29
+  0x00, 0x00,  // row 30
+  0x00, 0x00   // row 31
+};
+
+// Display instance
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+bool displayOn = true;
+volatile bool buttonPressed = false;
+unsigned long lastButtonTime = 0;
 
 // Radio instance (SX1276 for T-Beam 1.1 868MHz)
 SX1276 *radio = nullptr;
@@ -114,11 +168,86 @@ void markSeen(uint32_t hash) {
     dedupIndex = (dedupIndex + 1) % DEDUP_SIZE;
 }
 
-// Blink LED
-void blinkLed(int ms) {
-    digitalWrite(LED_PIN, HIGH);
-    delay(ms);
-    digitalWrite(LED_PIN, LOW);
+
+// Peer tracking (simple: count unique source IDs seen)
+#define MAX_PEERS 16
+uint8_t peerIds[MAX_PEERS][16];  // Store first 16 bytes (source ID area)
+uint8_t peerCount = 0;
+
+void trackPeer(const uint8_t* packet, int len) {
+    if (len < 18) return;  // Need at least header + some ID bytes
+
+    // Check if we've seen this source before (bytes 2-17 contain source area)
+    for (int i = 0; i < peerCount; i++) {
+        if (memcmp(peerIds[i], packet + 2, 16) == 0) {
+            return;  // Already known
+        }
+    }
+
+    // Add new peer
+    if (peerCount < MAX_PEERS) {
+        memcpy(peerIds[peerCount], packet + 2, 16);
+        peerCount++;
+    }
+}
+
+// Button ISR for display toggle
+#if defined(ESP8266) || defined(ESP32)
+ICACHE_RAM_ATTR
+#endif
+void buttonISR() {
+    buttonPressed = true;
+}
+
+// Update display
+void updateDisplay() {
+    if (!displayOn) {
+        display.clearDisplay();
+        display.display();
+        return;
+    }
+
+    display.clearDisplay();
+
+    // Logo on left side
+    display.drawBitmap(0, 16, norr_logo, LOGO_WIDTH, LOGO_HEIGHT, SSD1306_WHITE);
+
+    // Vertical separator
+    display.drawLine(20, 0, 20, 63, SSD1306_WHITE);
+
+    // Content area starts at x=24
+    display.setTextColor(SSD1306_WHITE);
+
+    // Row 1: "Router" title
+    display.setTextSize(2);
+    display.setCursor(24, 0);
+    display.print("Router");
+
+    display.setTextSize(1);
+
+    // Row 2: Version
+    display.setCursor(24, 20);
+    display.print("v");
+    display.print(FW_VERSION);
+    display.print(" ");
+    display.print((int)RF_FREQUENCY);
+    display.print("MHz");
+
+    // Row 3: RX/TX
+    display.setCursor(24, 34);
+    display.print("RX:");
+    display.print(rxCount);
+    display.print(" TX:");
+    display.print(txCount);
+
+    // Row 4: Peers and drops
+    display.setCursor(24, 48);
+    display.print("Peers:");
+    display.print(peerCount);
+    display.print(" Drop:");
+    display.print(dropDup + dropHop + dropFmt);
+
+    display.display();
 }
 
 void setup() {
@@ -130,10 +259,6 @@ void setup() {
     Serial.println(" Norr Router v" FW_VERSION);
     Serial.println(" T-Beam 1.1 - Transparent Relay");
     Serial.println("=================================");
-
-    // LED
-    pinMode(LED_PIN, OUTPUT);
-    digitalWrite(LED_PIN, LOW);
 
     // Initialize I2C for AXP power management
     Wire.begin(21, 22);  // T-Beam I2C pins
@@ -227,8 +352,7 @@ void setup() {
         Serial.println(state);
         Serial.println("[LoRa] Check wiring and power");
         while (true) {
-            blinkLed(100);
-            delay(100);
+            delay(1000);  // Halt on error
         }
     }
     Serial.println("OK");
@@ -249,9 +373,42 @@ void setup() {
 
     // Clear dedup buffer
     memset(dedupBuffer, 0, sizeof(dedupBuffer));
+
+    // Initialize OLED display
+    Serial.print("[OLED] ");
+    if (display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+        Serial.println("OK");
+        display.clearDisplay();
+        display.display();
+        updateDisplay();
+    } else {
+        Serial.println("Not found");
+    }
+
+    // Button for display toggle
+    pinMode(BUTTON_PIN, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), buttonISR, FALLING);
 }
 
 void loop() {
+    // Handle button press (debounce 200ms)
+    if (buttonPressed) {
+        unsigned long now = millis();
+        if (now - lastButtonTime > 200) {
+            displayOn = !displayOn;
+            updateDisplay();
+            lastButtonTime = now;
+        }
+        buttonPressed = false;
+    }
+
+    // Periodic display update (every 1s)
+    static uint32_t lastDisplayUpdate = 0;
+    if (millis() - lastDisplayUpdate > 1000) {
+        lastDisplayUpdate = millis();
+        updateDisplay();
+    }
+
     if (!receivedFlag) {
         return;
     }
@@ -272,6 +429,7 @@ void loop() {
     }
 
     rxCount++;
+    trackPeer(rxBuffer, rxLen);
 
     // Need at least 2 bytes for header
     if (rxLen < 2) {
@@ -337,7 +495,6 @@ void loop() {
         Serial.print(", delay ");
         Serial.print(delayMs);
         Serial.println("ms");
-        blinkLed(50);
     } else {
         Serial.print("[ERROR] TX failed: ");
         Serial.println(state);
