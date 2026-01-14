@@ -292,6 +292,13 @@ void setup() {
             Wire.write(aldoEn | 0x02);  // Enable ALDO2
             Wire.endTransmission();
 
+            // Disable CHGLED blinking - only on when charging
+            // Register 0x69: bits[1:0] = 00 off, 01 blink1Hz, 10 blink4Hz, 11 on
+            Wire.beginTransmission(AXP_ADDR);
+            Wire.write(0x69);
+            Wire.write(0x00);  // LED off (charging LED still works via hardware)
+            Wire.endTransmission();
+
             Serial.println("AXP2101 OK");
         } else {
             // AXP192: Enable LDO2 for LoRa
@@ -317,6 +324,12 @@ void setup() {
         Serial.println("NO AXP - power may fail!");
     }
     delay(500);  // Let power stabilize
+
+    // Ensure all LEDs are off (GPIO 4 and 14 are used on different T-Beam versions)
+    pinMode(4, OUTPUT);
+    digitalWrite(4, LOW);
+    pinMode(14, OUTPUT);
+    digitalWrite(14, LOW);
 
     // Reset LoRa module
     pinMode(LORA_RST, OUTPUT);
