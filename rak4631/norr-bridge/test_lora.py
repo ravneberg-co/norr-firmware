@@ -11,8 +11,8 @@ import threading
 import sys
 
 # Serial ports for the two RAK4631 devices
-PORT1 = '/dev/cu.usbmodem1201'
-PORT2 = '/dev/cu.usbmodem1301'
+PORT1 = '/dev/ttyACM1'
+PORT2 = '/dev/ttyACM2'
 BAUD = 115200
 
 # Protocol constants

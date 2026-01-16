@@ -19,7 +19,7 @@
 #include <Adafruit_SSD1306.h>
 
 // Firmware version
-#define FW_VERSION "2.5"  // Added reactive flow control (READY signal)
+#define FW_VERSION "2.6"  // Fixed TX timeout recovery (library sleep handling)
 
 // OLED Configuration (RAK1921 - SSD1306 128x64)
 #define SCREEN_WIDTH 128
@@ -69,6 +69,9 @@ static int8_t lastSnr = 0;
 static unsigned long txFlashUntil = 0;
 static unsigned long rxFlashUntil = 0;
 static unsigned long lastDisplayUpdate = 0;
+
+// Recovery flag - library puts radio to sleep after timeout, we need to restart RX
+static volatile bool needsRxRestart = false;
 
 // Peer tracking - based on first 16 bytes (DestinationID in Norr wire format)
 #define MAX_PEERS 8
@@ -188,7 +191,7 @@ void setup() {
   // Initialize serial
   Serial.begin(115200);
 
-  time_t timeout = millis();
+  unsigned long timeout = millis();
   while (!Serial) {
     if ((millis() - timeout) < 3000) {
       delay(100);
@@ -262,6 +265,13 @@ void loop() {
 
   // Handle incoming serial data
   handleSerialInput();
+
+  // Restart RX after timeout recovery (library puts radio to sleep after timeout)
+  if (needsRxRestart) {
+    needsRxRestart = false;
+    delay(20);
+    Radio.Rx(RX_TIMEOUT_VALUE);
+  }
 
   // Update display periodically
   if (oledAvailable && (millis() - lastDisplayUpdate > DISPLAY_UPDATE_MS)) {
@@ -449,11 +459,14 @@ void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr) {
 }
 
 // LoRa TX Timeout callback
+// NOTE: Library puts radio to sleep AFTER this callback returns,
+// so we set a flag and restart RX from main loop
 void OnTxTimeout(void) {
   Serial.println("[TX] Timeout");
   txDone = true;
-  delay(20);
-  Radio.Rx(RX_TIMEOUT_VALUE);
+  txFlashUntil = millis() + 200;
+  needsRxRestart = true;  // Main loop will restart RX after library sleeps radio
+  Serial.println("READY");
 }
 
 // LoRa RX Timeout callback
