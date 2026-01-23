@@ -181,6 +181,7 @@ void OnTxTimeout(void);
 void OnRxTimeout(void);
 void OnRxError(void);
 void handleSerialInput();
+void handleInfoRequest();
 uint16_t calculateCRC(uint8_t* data, size_t len);
 void sendToSerial(uint8_t* data, size_t len);
 void initOLED();
@@ -510,6 +511,22 @@ void sendToSerial(uint8_t* data, size_t len) {
   Serial.flush();
 }
 
+// Handle ?INFO query command
+void handleInfoRequest() {
+  Serial.print("!INFO:v=");
+  Serial.print(FW_VERSION);
+  Serial.print(",peers=");
+  Serial.print(peerCount);
+  Serial.print(",rssi=");
+  Serial.print(lastRssi);
+  Serial.print(",snr=");
+  Serial.print(lastSnr);
+  Serial.print(",tx=");
+  Serial.print(txCount);
+  Serial.print(",rx=");
+  Serial.println(rxCount);
+}
+
 // Handle serial input and send via LoRa
 void handleSerialInput() {
   static enum { WAIT_START, READ_LEN_HI, READ_LEN_LO, READ_PAYLOAD, READ_CRC_HI, READ_CRC_LO, WAIT_END } state = WAIT_START;
@@ -517,6 +534,8 @@ void handleSerialInput() {
   static uint16_t bytesRead = 0;
   static uint16_t receivedCrc = 0;
   static unsigned long lastByte = 0;
+  static char cmdBuffer[8];
+  static uint8_t cmdIndex = 0;
 
   while (Serial.available()) {
     uint8_t b = Serial.read();
@@ -527,7 +546,19 @@ void handleSerialInput() {
         if (b == START_MARKER) {
           state = READ_LEN_HI;
           bytesRead = 0;
+          cmdIndex = 0;
           queueCount++;  // Track pending TX
+        } else if (b == '?' || (cmdIndex > 0 && cmdIndex < sizeof(cmdBuffer) - 1)) {
+          cmdBuffer[cmdIndex++] = b;
+          cmdBuffer[cmdIndex] = '\0';
+          if (b == '\n' || b == '\r') {
+            if (strcmp(cmdBuffer, "?INFO\n") == 0 || strcmp(cmdBuffer, "?INFO\r") == 0) {
+              handleInfoRequest();
+            }
+            cmdIndex = 0;
+          }
+        } else {
+          cmdIndex = 0;
         }
         break;
 
