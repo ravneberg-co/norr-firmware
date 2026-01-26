@@ -1,0 +1,141 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-rak4631:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Arduino CLI
+        uses: arduino/setup-arduino-cli@v1
+
+      - name: Install RAKwireless nRF52 BSP
+        run: |
+          arduino-cli config init
+          arduino-cli config add board_manager.additional_urls https://raw.githubusercontent.com/RAKWireless/RAKwireless-Arduino-BSP-Index/main/package_rakwireless.com_rui_index.json
+          arduino-cli core update-index
+          arduino-cli core install rakwireless:nrf52
+
+      - name: Install libraries
+        run: |
+          arduino-cli lib install "SX126x-Arduino"
+          arduino-cli lib install "Adafruit GFX Library"
+          arduino-cli lib install "Adafruit SSD1306"
+
+      - name: Build RAK4631 norr-bridge
+        run: |
+          arduino-cli compile --fqbn rakwireless:nrf52:WisCoreRAK4631Board \
+            --output-dir build/rak4631 \
+            rak4631/norr-bridge/norr-bridge.ino
+
+      - name: Package artifacts
+        run: |
+          # Get version from .ino file
+          VERSION=$(grep '#define FW_VERSION' rak4631/norr-bridge/norr-bridge.ino | sed 's/.*"\(.*\)"/\1/')
+          mv build/rak4631/norr-bridge.ino.uf2 norr-bridge-rak4631-v${VERSION}.uf2
+          mv build/rak4631/norr-bridge.ino.hex norr-bridge-rak4631-v${VERSION}.hex
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rak4631-firmware
+          path: |
+            *.uf2
+            *.hex
+
+  build-tbeam-platformio:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install PlatformIO
+        run: pip install platformio
+
+      - name: Build T-Beam norr-router
+        run: |
+          cd tbeam/norr-router
+          pio run
+
+      - name: Package artifacts
+        run: |
+          # Get version from source if available, otherwise use tag
+          VERSION="${GITHUB_REF_NAME#v}"
+          cp tbeam/norr-router/.pio/build/tbeam/firmware.bin norr-router-tbeam-v${VERSION}.bin
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tbeam-router-firmware
+          path: "*.bin"
+
+  release:
+    needs: [build-rak4631, build-tbeam-platformio]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get version info
+        id: versions
+        run: |
+          # Get RAK4631 firmware version
+          RAK_VERSION=$(grep '#define FW_VERSION' rak4631/norr-bridge/norr-bridge.ino | sed 's/.*"\(.*\)"/\1/')
+          echo "rak_version=$RAK_VERSION" >> $GITHUB_OUTPUT
+
+          # Get previous tag
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          echo "prev_tag=$PREV_TAG" >> $GITHUB_OUTPUT
+
+      - name: Generate release notes
+        run: |
+          PREV_TAG="${{ steps.versions.outputs.prev_tag }}"
+          REPO_URL="https://github.com/${{ github.repository }}"
+
+          echo "## ${{ github.ref_name }}" > release_notes.md
+          echo "" >> release_notes.md
+          echo "### Firmware versions" >> release_notes.md
+          echo "- **RAK4631 norr-bridge**: v${{ steps.versions.outputs.rak_version }}" >> release_notes.md
+          echo "" >> release_notes.md
+          echo "### Installation" >> release_notes.md
+          echo "- **RAK4631**: Copy \`.uf2\` file to device (double-tap RESET to enter bootloader)" >> release_notes.md
+          echo "- **T-Beam**: Flash \`.bin\` with esptool or PlatformIO" >> release_notes.md
+          echo "" >> release_notes.md
+
+          echo "### Changes" >> release_notes.md
+          echo "" >> release_notes.md
+
+          if [ -n "$PREV_TAG" ]; then
+            git log --pretty=format:"- %s ([%h]($REPO_URL/commit/%H))" "$PREV_TAG"..HEAD >> release_notes.md
+          else
+            git log --pretty=format:"- %s ([%h]($REPO_URL/commit/%H))" -20 >> release_notes.md
+          fi
+
+          echo "" >> release_notes.md
+          echo "" >> release_notes.md
+          echo "---" >> release_notes.md
+          echo "[Full changelog]($REPO_URL/commits/${{ github.ref_name }})" >> release_notes.md
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: artifacts/**/*
+          body_path: release_notes.md
